@@ -3,6 +3,7 @@ import sys
 import json
 import requests
 from datetime import datetime, timedelta
+from collections import OrderedDict
 
 
 # ─── Configuration ───────────────────────────────────────────────
@@ -16,66 +17,16 @@ BASE_URL = f"https://graph.facebook.com/{API_VERSION}"
 
 
 def get_yesterday():
-    """Return yesterday's date as a string (YYYY-MM-DD)."""
     yesterday = datetime.now() - timedelta(days=1)
     return yesterday.strftime("%Y-%m-%d")
 
 
 def get_yesterday_display():
-    """Return yesterday's date in a readable format (e.g. 8 Feb 2026)."""
     yesterday = datetime.now() - timedelta(days=1)
     return yesterday.strftime("%-d %b %Y")
 
 
-def fetch_active_ads():
-    """Fetch all currently active ads from the ad account."""
-    endpoint = f"{BASE_URL}/act_{META_AD_ACCOUNT_ID}/ads"
-    params = {
-        "access_token": META_ACCESS_TOKEN,
-        "fields": "id,name,campaign.fields(name),adset.fields(name),effective_status",
-        "filtering": json.dumps([{
-            "field": "effective_status",
-            "operator": "IN",
-            "value": ["ACTIVE"],
-        }]),
-        "limit": 200,
-    }
-
-    response = requests.get(endpoint, params=params, timeout=30)
-    response.raise_for_status()
-
-    return response.json().get("data", [])
-
-
-def fetch_ad_insights(ad_id, date_str):
-    """Pull insights for a single ad for a given day."""
-    endpoint = f"{BASE_URL}/{ad_id}/insights"
-    params = {
-        "access_token": META_ACCESS_TOKEN,
-        "time_range": json.dumps({"since": date_str, "until": date_str}),
-        "fields": ",".join([
-            "ad_name",
-            "campaign_name",
-            "adset_name",
-            "spend",
-            "impressions",
-            "clicks",
-            "ctr",
-            "cpc",
-            "actions",
-            "cost_per_action_type",
-        ]),
-    }
-
-    response = requests.get(endpoint, params=params, timeout=30)
-    response.raise_for_status()
-
-    data = response.json().get("data", [])
-    return data[0] if data else None
-
-
 def fetch_all_active_ad_insights(date_str):
-    """Fetch insights for all active ads in one API call at ad level."""
     endpoint = f"{BASE_URL}/act_{META_AD_ACCOUNT_ID}/insights"
     params = {
         "access_token": META_ACCESS_TOKEN,
@@ -84,7 +35,9 @@ def fetch_all_active_ad_insights(date_str):
             "ad_id",
             "ad_name",
             "campaign_name",
+            "campaign_id",
             "adset_name",
+            "adset_id",
             "spend",
             "impressions",
             "clicks",
@@ -104,12 +57,10 @@ def fetch_all_active_ad_insights(date_str):
 
     response = requests.get(endpoint, params=params, timeout=30)
     response.raise_for_status()
-
     return response.json().get("data", [])
 
 
 def extract_leads(actions):
-    """Extract lead count from the actions array."""
     if not actions:
         return 0
     for action in actions:
@@ -119,149 +70,158 @@ def extract_leads(actions):
 
 
 def parse_ad_metrics(row):
-    """Parse a single ad's insight row into clean metrics."""
     spend = float(row.get("spend", 0))
     impressions = int(row.get("impressions", 0))
     clicks = int(row.get("clicks", 0))
     leads = extract_leads(row.get("actions"))
 
-    ctr = (clicks / impressions) * 100 if impressions > 0 else 0
-    cpc = spend / clicks if clicks > 0 else 0
-    cpl = spend / leads if leads > 0 else 0
-
     return {
+        "ad_id": row.get("ad_id", ""),
         "ad_name": row.get("ad_name", "Unknown Ad"),
         "campaign_name": row.get("campaign_name", "Unknown Campaign"),
+        "campaign_id": row.get("campaign_id", ""),
         "adset_name": row.get("adset_name", "Unknown Ad Set"),
+        "adset_id": row.get("adset_id", ""),
         "spend": spend,
         "impressions": impressions,
         "clicks": clicks,
-        "ctr": ctr,
-        "cpc": cpc,
+        "ctr": (clicks / impressions) * 100 if impressions > 0 else 0,
+        "cpc": spend / clicks if clicks > 0 else 0,
         "leads": leads,
-        "cpl": cpl,
+        "cpl": spend / leads if leads > 0 else 0,
     }
 
 
-def calculate_totals(ads):
-    """Calculate totals across all ads."""
-    totals = {
-        "spend": 0.0,
-        "impressions": 0,
-        "clicks": 0,
-        "leads": 0,
-        "ctr": 0.0,
-        "cpc": 0.0,
-        "cpl": 0.0,
-    }
+def group_by_campaign_adset(ads):
+    """Group ads into Campaign → Ad Set → Ads hierarchy."""
+    campaigns = OrderedDict()
 
     for ad in ads:
-        totals["spend"] += ad["spend"]
-        totals["impressions"] += ad["impressions"]
-        totals["clicks"] += ad["clicks"]
-        totals["leads"] += ad["leads"]
+        cid = ad["campaign_id"]
+        asid = ad["adset_id"]
 
-    if totals["impressions"] > 0:
-        totals["ctr"] = (totals["clicks"] / totals["impressions"]) * 100
-    if totals["clicks"] > 0:
-        totals["cpc"] = totals["spend"] / totals["clicks"]
-    if totals["leads"] > 0:
-        totals["cpl"] = totals["spend"] / totals["leads"]
+        if cid not in campaigns:
+            campaigns[cid] = {
+                "name": ad["campaign_name"],
+                "adsets": OrderedDict(),
+                "spend": 0, "impressions": 0, "clicks": 0, "leads": 0,
+            }
+        campaigns[cid]["spend"] += ad["spend"]
+        campaigns[cid]["impressions"] += ad["impressions"]
+        campaigns[cid]["clicks"] += ad["clicks"]
+        campaigns[cid]["leads"] += ad["leads"]
 
-    return totals
+        if asid not in campaigns[cid]["adsets"]:
+            campaigns[cid]["adsets"][asid] = {
+                "name": ad["adset_name"],
+                "ads": [],
+                "spend": 0, "impressions": 0, "clicks": 0, "leads": 0,
+            }
+        campaigns[cid]["adsets"][asid]["spend"] += ad["spend"]
+        campaigns[cid]["adsets"][asid]["impressions"] += ad["impressions"]
+        campaigns[cid]["adsets"][asid]["clicks"] += ad["clicks"]
+        campaigns[cid]["adsets"][asid]["leads"] += ad["leads"]
+        campaigns[cid]["adsets"][asid]["ads"].append(ad)
+
+    return campaigns
+
+
+def calc_derived(m):
+    """Calculate CTR, CPC, CPL from raw totals."""
+    return {
+        **m,
+        "ctr": (m["clicks"] / m["impressions"]) * 100 if m["impressions"] > 0 else 0,
+        "cpc": m["spend"] / m["clicks"] if m["clicks"] > 0 else 0,
+        "cpl": m["spend"] / m["leads"] if m["leads"] > 0 else 0,
+    }
 
 
 def format_number(n):
-    """Format a number with commas (e.g. 12,430)."""
     return f"{n:,}"
 
 
 def format_currency(amount):
-    """Format a currency amount (e.g. $124.50)."""
     return f"{CURRENCY_SYMBOL}{amount:,.2f}"
 
 
-def build_ad_block(ad):
-    """Build Slack blocks for a single ad."""
+def metrics_fields(m):
+    """Return a standard set of Slack fields for any level's metrics."""
     return [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*{ad['ad_name']}*\n_{ad['campaign_name']} → {ad['adset_name']}_",
-            },
-        },
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Spend:* {format_currency(ad['spend'])}"},
-                {"type": "mrkdwn", "text": f"*Impressions:* {format_number(ad['impressions'])}"},
-                {"type": "mrkdwn", "text": f"*Clicks:* {format_number(ad['clicks'])}"},
-                {"type": "mrkdwn", "text": f"*CTR:* {ad['ctr']:.2f}%"},
-                {"type": "mrkdwn", "text": f"*CPC:* {format_currency(ad['cpc'])}"},
-                {"type": "mrkdwn", "text": f"*Leads:* {format_number(ad['leads'])}"},
-            ],
-        },
+        {"type": "mrkdwn", "text": f"*Spend:* {format_currency(m['spend'])}"},
+        {"type": "mrkdwn", "text": f"*Impressions:* {format_number(m['impressions'])}"},
+        {"type": "mrkdwn", "text": f"*Clicks:* {format_number(m['clicks'])}"},
+        {"type": "mrkdwn", "text": f"*CTR:* {m['ctr']:.2f}%"},
+        {"type": "mrkdwn", "text": f"*CPC:* {format_currency(m['cpc'])}"},
+        {"type": "mrkdwn", "text": f"*Leads:* {format_number(m['leads'])}"},
     ]
 
 
-def build_slack_message(ads, totals, date_display):
-    """Build the full Slack message with every active ad + totals."""
+def build_slack_message(campaigns, totals, date_display, ad_count):
     blocks = [
         {
             "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": f"Cost Guide — Daily Ad Report ({date_display})",
-            },
+            "text": {"type": "plain_text", "text": f"Ads Daily Report ({date_display})"},
         },
         {
             "type": "context",
             "elements": [
-                {"type": "mrkdwn", "text": f"*{len(ads)} active ad(s)* reporting yesterday's results"},
+                {"type": "mrkdwn", "text": f"{len(campaigns)} campaign(s) | {ad_count} active ad(s)"},
             ],
         },
         {"type": "divider"},
     ]
 
-    # Add each individual ad
-    for ad in ads:
-        blocks.extend(build_ad_block(ad))
+    for cid, campaign in campaigns.items():
+        cm = calc_derived(campaign)
+
+        # Campaign header
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*CAMPAIGN: {campaign['name']}*"},
+        })
+        blocks.append({"type": "section", "fields": metrics_fields(cm)})
+
+        for asid, adset in campaign["adsets"].items():
+            asm = calc_derived(adset)
+
+            # Ad Set header (indented with emoji)
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"    *Ad Set: {adset['name']}*"},
+            })
+            blocks.append({"type": "section", "fields": metrics_fields(asm)})
+
+            # Individual ads
+            for ad in adset["ads"]:
+                blocks.append({
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": f"*{ad['ad_name']}*  |  Spend: {format_currency(ad['spend'])}  |  Imp: {format_number(ad['impressions'])}  |  Clicks: {format_number(ad['clicks'])}  |  CTR: {ad['ctr']:.2f}%  |  Leads: {ad['leads']}"},
+                    ],
+                })
+
         blocks.append({"type": "divider"})
 
-    # Add totals summary
+    # Overall totals
     blocks.append({
         "type": "header",
-        "text": {
-            "type": "plain_text",
-            "text": "Totals",
-        },
+        "text": {"type": "plain_text", "text": "Overall Totals"},
     })
-    blocks.append({
-        "type": "section",
-        "fields": [
-            {"type": "mrkdwn", "text": f"*Total Spend:* {format_currency(totals['spend'])}"},
-            {"type": "mrkdwn", "text": f"*Total Impressions:* {format_number(totals['impressions'])}"},
-            {"type": "mrkdwn", "text": f"*Total Clicks:* {format_number(totals['clicks'])}"},
-            {"type": "mrkdwn", "text": f"*Overall CTR:* {totals['ctr']:.2f}%"},
-            {"type": "mrkdwn", "text": f"*Avg CPC:* {format_currency(totals['cpc'])}"},
-            {"type": "mrkdwn", "text": f"*Total Leads:* {format_number(totals['leads'])}"},
-        ],
-    })
-    blocks.append({
-        "type": "section",
-        "fields": [
-            {"type": "mrkdwn", "text": f"*Overall Cost Per Lead:* {format_currency(totals['cpl'])}"},
-        ],
-    })
+    blocks.append({"type": "section", "fields": metrics_fields(totals)})
+    if totals["leads"] > 0:
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Cost Per Lead:* {format_currency(totals['cpl'])}"},
+            ],
+        })
 
-    # Warning if no active ads had spend
     if totals["spend"] == 0:
         blocks.append({"type": "divider"})
         blocks.append({
             "type": "context",
             "elements": [
-                {"type": "mrkdwn", "text": "No ad spend recorded yesterday. Ads may have just been switched on or had no delivery."},
+                {"type": "mrkdwn", "text": "No ad spend recorded yesterday. Ads may have had no delivery."},
             ],
         })
 
@@ -269,30 +229,22 @@ def build_slack_message(ads, totals, date_display):
 
 
 def build_no_ads_message(date_display):
-    """Build a Slack message when no active ads are found."""
     return {
         "blocks": [
             {
                 "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"Cost Guide — Daily Ad Report ({date_display})",
-                },
+                "text": {"type": "plain_text", "text": f"Ads Daily Report ({date_display})"},
             },
             {"type": "divider"},
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "No active ads found in the account yesterday. All campaigns may be paused.",
-                },
+                "text": {"type": "mrkdwn", "text": "No active ads found yesterday. All campaigns may be paused."},
             },
         ]
     }
 
 
 def send_to_slack(message):
-    """Post the formatted message to Slack via webhook."""
     response = requests.post(
         SLACK_WEBHOOK_URL,
         json=message,
@@ -320,26 +272,30 @@ def main():
 
     if not raw_data:
         print("No active ads with data found.")
-        message = build_no_ads_message(date_display)
-        send_to_slack(message)
+        send_to_slack(build_no_ads_message(date_display))
         return
 
-    # Parse each ad's metrics
     ads = [parse_ad_metrics(row) for row in raw_data]
+    campaigns = group_by_campaign_adset(ads)
 
-    # Sort by spend (highest first)
-    ads.sort(key=lambda a: a["spend"], reverse=True)
-
-    totals = calculate_totals(ads)
-
-    print(f"Found {len(ads)} active ad(s):")
+    # Calculate overall totals
+    totals = {"spend": 0, "impressions": 0, "clicks": 0, "leads": 0}
     for ad in ads:
-        print(f"  [{ad['campaign_name']}] {ad['ad_name']}: {format_currency(ad['spend'])} spend, {ad['leads']} leads")
-    print(f"\n  Total Spend: {format_currency(totals['spend'])}")
-    print(f"  Total Leads: {totals['leads']}")
-    print(f"  Overall CPL: {format_currency(totals['cpl'])}")
+        totals["spend"] += ad["spend"]
+        totals["impressions"] += ad["impressions"]
+        totals["clicks"] += ad["clicks"]
+        totals["leads"] += ad["leads"]
+    totals = calc_derived(totals)
 
-    message = build_slack_message(ads, totals, date_display)
+    print(f"Found {len(ads)} active ad(s) across {len(campaigns)} campaign(s):")
+    for cid, c in campaigns.items():
+        print(f"  Campaign: {c['name']} ({format_currency(c['spend'])})")
+        for asid, a in c["adsets"].items():
+            print(f"    Ad Set: {a['name']} ({format_currency(a['spend'])})")
+            for ad in a["ads"]:
+                print(f"      Ad: {ad['ad_name']} ({format_currency(ad['spend'])})")
+
+    message = build_slack_message(campaigns, totals, date_display, len(ads))
     send_to_slack(message)
 
 
