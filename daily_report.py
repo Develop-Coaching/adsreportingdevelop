@@ -14,6 +14,16 @@ CURRENCY_SYMBOL = os.environ.get("CURRENCY_SYMBOL", "$")
 API_VERSION = "v19.0"
 BASE_URL = f"https://graph.facebook.com/{API_VERSION}"
 
+# Action types that count as a "lead" / conversion
+LEAD_ACTION_TYPES = {
+    "lead",
+    "offsite_conversion.fb_pixel_lead",
+    "complete_registration",
+    "offsite_conversion.fb_pixel_complete_registration",
+    "offsite_complete_registration_add_meta_leads",
+    "onsite_conversion.lead_grouped",
+}
+
 
 def get_date_str(days_ago):
     d = datetime.now() - timedelta(days=days_ago)
@@ -53,12 +63,15 @@ def fetch_campaign_insights(date_str):
 
 
 def extract_leads(actions):
+    """Extract lead/conversion count — takes the highest single matching action type
+    to avoid double-counting (Meta often reports the same conversion under multiple types)."""
     if not actions:
         return 0
+    best = 0
     for action in actions:
-        if action.get("action_type") in ("lead", "offsite_conversion.fb_pixel_lead"):
-            return int(action.get("value", 0))
-    return 0
+        if action.get("action_type") in LEAD_ACTION_TYPES:
+            best = max(best, int(action.get("value", 0)))
+    return best
 
 
 def parse_campaign(row):
@@ -212,6 +225,10 @@ def main():
 
     prev_campaigns = [parse_campaign(row) for row in raw_day_before]
     prev_lookup = {c["campaign_id"]: c for c in prev_campaigns}
+
+    print(f"Found {len(campaigns)} active campaign(s):")
+    for c in campaigns:
+        print(f"  {c['campaign_name']}: {fmt_money(c['spend'])} | {c['leads']} leads")
 
     message = build_slack_message(campaigns, prev_lookup, date_display)
     send_to_slack(message)
